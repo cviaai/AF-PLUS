@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-from k_space_reconstruction.nets.base import BaseReconstructionModule
-from k_space_reconstruction.utils.kspace import pt_kspace2spatial as FtH
-from k_space_reconstruction.utils.kspace import pt_spatial2kspace as Ft
+from utils.kspace import pt_kspace2spatial as FtH
+from utils.kspace import pt_spatial2kspace as Ft
 
 
 """
@@ -191,66 +190,3 @@ class TransposeConvBlock(nn.Module):
             Output tensor of shape `(N, out_chans, H*2, W*2)`.
         """
         return self.layers(image)
-
-
-class UnetModule(BaseReconstructionModule):
-
-    def __init__(self, **kwargs):
-        super(UnetModule, self).__init__(**kwargs)
-
-    def forward(self, x):
-        return self.net(x.unsqueeze(1)).squeeze(1)
-
-    def get_net(self, **kwargs):
-        return Unet(
-            in_chans=1,
-            out_chans=1,
-            num_pool_layers=kwargs['unet_num_layers'],
-            chans=kwargs['unet_chans'],
-        )
-
-
-class PhaseUnetModule(BaseReconstructionModule):
-
-    def __init__(self, **kwargs):
-        super(PhaseUnetModule, self).__init__(**kwargs)
-
-    def forward(self, x):
-        return self.net(x.unsqueeze(1)).squeeze(1)
-
-    def predict(self, batch):
-        x_ks = batch['k_space'][:, 0] + 1j * batch['k_space'][:, 1]
-        x_ks = x_ks[:, None]
-        yp = Ft(self.net(batch['sampled_image']) * batch['std'] + batch['mean'])
-        yp = FtH(x_ks.abs() * (1j * yp.angle()).exp()).abs()
-        yp = (yp - batch['mean']) / (batch['std'] + 1e-11)
-        return yp
-
-    def get_net(self, **kwargs):
-        return Unet(
-            in_chans=1,
-            out_chans=1,
-            num_pool_layers=kwargs['unet_num_layers'],
-            chans=kwargs['unet_chans'],
-        )
-
-
-class UnetFOLModule(BaseReconstructionModule):
-
-    def __init__(self, **kwargs):
-        super(UnetFOLModule, self).__init__(**kwargs)
-
-    def forward(self, x):
-        return x * self.net(x.unsqueeze(1)).squeeze(1)
-
-    def predict(self, batch):
-        ks, mask, y, x, mean, std, f_name, slice_id, max_val = batch
-        return ((x * std + mean) * self.net(x) - mean) / (std + 1e-11)
-
-    def get_net(self, **kwargs):
-        return Unet(
-            in_chans=1,
-            out_chans=1,
-            num_pool_layers=kwargs['unet_num_layers'],
-            chans=kwargs['unet_chans'],
-        )

@@ -8,19 +8,21 @@ import torch
 import torch.nn.functional as F
 import h5py
 from torch.utils.tensorboard import SummaryWriter
-from k_space_reconstruction.utils.metrics import psnr, ssim
 import piq
 
-from k_space_reconstruction.datasets.fastmri import FastMRITransform, DemotionFastMRIh5Dataset, RandomMaskFunc
-from k_space_reconstruction.utils.kspace import RandomMotionTransform
-from k_space_reconstruction.nets.unet import Unet
-from k_space_reconstruction.utils.kspace import pt_spatial2kspace, pt_kspace2spatial
+from config import PATH
+
+from utils.fastmri import FastMRITransform, DemotionFastMRIh5Dataset
+from utils.kspace import RandomMotionTransform
+from utils.utils import get_loss_func
+from utils.unet import Unet
+from utils.kspace import pt_spatial2kspace, pt_kspace2spatial
 from tqdm import tqdm
 import skimage.data
-from k_space_reconstruction.utils.metrics import l1_loss
+from utils.utils import t2i, normalize, psnr, ssim, l1_loss
 
 import sys
-sys.path.append('./pytorch_nufft')
+sys.path.append(PATH.NUFFT_PATH)  # import NUFFT library
 import nufft
 from torch.fft import fftshift, ifftshift, fftn, ifftn
 
@@ -28,37 +30,23 @@ Ft = lambda x : fftshift(fftn(ifftshift(x, dim=(-1, -2)), dim=(-1, -2)), dim=(-1
 IFt = lambda x : ifftshift(ifftn(fftshift(x, dim=(-1, -2)), dim=(-1, -2)), dim=(-1, -2))
 from IPython.display import clear_output
 
+
 random.seed(228)
 torch.manual_seed(228)
 torch.cuda.manual_seed(228)
 np.random.seed(228)
 
-def t2i(t):
-    q = t - t.min()
-    w = q / t.max()
-    return w * 255
-
-def psnr(img1, img2):
-    mse = torch.mean((t2i(img1) - t2i(img2)) ** 2)
-    return 20 * torch.log10(255. / torch.sqrt(mse))
-
-def ssim(img1, img2):
-    from pytorch_msssim import ssim
-    return ssim(t2i(img1)[None,None], t2i(img2)[None,None])
-
-def normalize(x):
-    x1 = x - x.min()
-    return x1 / x1.max()
-    
     
 def calc_metrics(y_pred: torch.Tensor, y_gt: torch.Tensor):
     metrics_dict = {}
     metrics_dict['psnr'] = psnr(y_pred, y_gt).item()
     metrics_dict['ssim'] = ssim(y_pred, y_gt).item()
     metrics_dict['l1_loss'] = F.l1_loss(y_pred, y_gt).item()
-    metrics_dict['ms_ssim'] = piq.multi_scale_ssim(normalize(y_pred), normalize(y_gt), data_range=1.).item()
-    metrics_dict['vif_p'] = piq.vif_p(normalize(y_pred), normalize(y_gt), data_range=1.).item()
-    
+    metrics_dict['ms_ssim'] = piq.multi_scale_ssim(normalize(y_pred),
+                                                   normalize(y_gt),
+                                                   data_range=1.).item()
+    metrics_dict['vif_p'] = piq.vif_p(normalize(y_pred),
+                                      normalize(y_gt), data_range=1.).item()
     return metrics_dict
 
 
@@ -79,35 +67,11 @@ def R_differentiable(ks, rot_vector, oversamp=5):
             torch.arange(-ks.shape[0]//2, ks.shape[0]//2).float(),
             torch.arange(-ks.shape[1]//2, ks.shape[1]//2).float(),
             indexing='ij')]).cuda()
-    grid = (rot_matrices @ grid.reshape(2, 320, 320).movedim(1, 0)).movedim(0, 1).reshape(2, -1)
-    img = nufft.nufft_adjoint(ks, grid.T, device='cuda', oversamp=oversamp, out_shape=[1, 1, *ks.shape])[0, 0]
+    grid = (rot_matrices @ \
+            grid.reshape(2, 320, 320).movedim(1, 0)).movedim(0, 1).reshape(2, -1)
+    img = nufft.nufft_adjoint(ks, grid.T, device='cuda', oversamp=oversamp, 
+                              out_shape=[1, 1, *ks.shape])[0, 0]
     return Ft(img)
-
-
-def l1_loss(pred_y, gt_y):
-    return ((t2i(gt_y) - t2i(pred_y)).abs()).sum() / torch.numel(pred_y)
-
-def compund_ssim_l1_loss(pred, gt):
-    from pytorch_msssim import ssim
-    f1 = l1_loss(pred, gt)
-    return (1 - 0.84) * f1 + 0.84 * (1 - ssim(gt[None,None], pred[None,None],
-                                              size_average=True,
-                                              nonnegative_ssim=True))
-
-def ssim_loss(pred_y, gt_y):
-    return 1 - ssim(pred_y, gt_y)
-    
-def get_loss_func(loss_name):
-    if loss_name == 'l1':
-        loss = l1_loss
-    elif loss_name == 'ssim':
-        loss = ssim_loss
-    elif loss_name == 'ssim_l1':
-        loss = compund_ssim_l1_loss
-    else:
-        raise ValueError('Incorrect loss function name :(') 
-        
-    return loss
     
 
 def parsing_args():
@@ -119,21 +83,25 @@ def parsing_args():
     parser.add_argument('--e', type=int, default=100, help='num of epoches')
     parser.add_argument('--verb', type=int, default=5, help='validate every N epoch')
     parser.add_argument('--accum', type=int, default=16, help='gradient accumulation')
-    parser.add_argument('--init', type=str, default='none', help='type of U-Net initialization')
-    
-    parser.add_argument('--t_lr', type=float, default=3e-4, help='learning rate for translation parameters')
-    parser.add_argument('--r_lr', type=float, default=3e-4, help='learning rate for rotation parameters')
-    parser.add_argument('--nn_lr', type=float, default=5e-5, help='learning rate for U-Net')
-    parser.add_argument('--train_steps', type=int, default=30, help='number of steps in training')
-    parser.add_argument('--val_steps', type=int, default=80, help='number of steps in validation')
-
-    parser.add_argument('--loss', type=str, default='ssim', help='Loss function used for U-Net train')
-    
+    parser.add_argument('--init', type=str, default='none', 
+                        help='type of U-Net initialization')
+    parser.add_argument('--t_lr', type=float, default=3e-4, 
+                        help='learning rate for translation parameters')
+    parser.add_argument('--r_lr', type=float, default=3e-4, 
+                        help='learning rate for rotation parameters')
+    parser.add_argument('--nn_lr', type=float, default=5e-5, 
+                        help='learning rate for U-Net')
+    parser.add_argument('--train_steps', type=int, default=30, 
+                        help='number of steps in training')
+    parser.add_argument('--val_steps', type=int, default=80, 
+                        help='number of steps in validation')
+    parser.add_argument('--loss', type=str, default='ssim', 
+                        help='Loss function used for U-Net train')
     args = parser.parse_args()
     return args
 
 
-def simult_de_motion(ks, gt_ks, true_rot_vector, true_shift_vector, args):
+def simult_de_motion(ks, gt_ks, args):
     beta1, beta2 = 0.89, 0.8999
     ps = ks.shape[-1]
     ps_cf = int((ps // 2) * 0.08)
@@ -156,15 +124,14 @@ def simult_de_motion(ks, gt_ks, true_rot_vector, true_shift_vector, args):
     rot_moment1 = torch.nn.Parameter(data=torch.zeros_like(rot_vector), requires_grad=True)
     rot_moment2 = torch.nn.Parameter(data=torch.zeros_like(rot_vector), requires_grad=True)
     
-    
     for j in range(args.val_steps):
         rot_vector = rot_vector * zero_middle
         x_shifts = x_shifts * zero_middle
         y_shifts = y_shifts * zero_middle
         # Translation
         phase_shift = -2 * math.pi * (
-            x_shifts * torch.linspace(0, 320, 320)[None, :, None].cuda() + 
-            y_shifts * torch.linspace(0, 320, 320)[None, None, :].cuda())[0]
+            x_shifts * torch.linspace(0, ps, ps)[None, :, None].cuda() + 
+            y_shifts * torch.linspace(0, ps, ps)[None, None, :].cuda())[0]
         yp_ks = ks.abs().cuda() * (1j * (ks.angle().cuda() + phase_shift)).exp()
         # Rotation
         new_k_space = R_differentiable(yp_ks, rot_vector)
@@ -178,19 +145,19 @@ def simult_de_motion(ks, gt_ks, true_rot_vector, true_shift_vector, args):
         x_moment2 = beta2 * x_moment2 + (1. - beta2) * x_grad * x_grad + 1e-24
         y_moment1 = beta1 * y_moment1 + (1. - beta1) * y_grad
         y_moment2 = beta2 * y_moment2 + (1. - beta2) * y_grad * y_grad + 1e-24
-        x_shifts = x_shifts - args.t_lr * x_moment1 * x_moment2.rsqrt()  # 2e-3
-        y_shifts = y_shifts - args.t_lr * y_moment1 * y_moment2.rsqrt()  # 2e-3
+        x_shifts = x_shifts - args.t_lr * x_moment1 * x_moment2.rsqrt()
+        y_shifts = y_shifts - args.t_lr * y_moment1 * y_moment2.rsqrt()
         rot_moment1 = beta1 * rot_moment1 + (1. - beta1) * rot_grad
         rot_moment2 = beta2 * rot_moment2 + (1. - beta2) * rot_grad * rot_grad + 1e-24
-        rot_vector = rot_vector - args.r_lr  * rot_moment1 * rot_moment2.rsqrt()  # 4e-3
+        rot_vector = rot_vector - args.r_lr  * rot_moment1 * rot_moment2.rsqrt()
  
     rot_vector = rot_vector * zero_middle
     x_shifts = x_shifts * zero_middle
     y_shifts = y_shifts * zero_middle
     # Translation
     phase_shift = -2 * math.pi * (
-        x_shifts * torch.linspace(0, 320, 320)[None, :, None].cuda() + 
-        y_shifts * torch.linspace(0, 320, 320)[None, None, :].cuda())[0]
+        x_shifts * torch.linspace(0, ps, ps)[None, :, None].cuda() + 
+        y_shifts * torch.linspace(0, ps, ps)[None, None, :].cuda())[0]
     yp_ks = ks.abs().cuda() * (1j * (ks.angle().cuda() + phase_shift)).exp()
     # Rotation
     new_k_space = R_differentiable(yp_ks, rot_vector)
@@ -204,7 +171,7 @@ def simult_de_motion(ks, gt_ks, true_rot_vector, true_shift_vector, args):
     return old_ks_metrics, mid_ks_metrics, new_ks_metrics
 
 
-def check_simple_algorithm_version(val_dataset, args):
+def check_simple_algorithm_version(val_dataset, args, verbose=True):
     old_metrics = []
     new_metrics = []
 
@@ -214,10 +181,7 @@ def check_simple_algorithm_version(val_dataset, args):
         ks = batch['k_space']
         ks = ks[0] + 1j * ks[1]
 
-        old, _, new = simult_de_motion(ks.cuda(), gt_ks.cuda(),
-                                       true_rot_vector=batch['rot_vector'],
-                                       true_shift_vector=batch['phase_shift'], 
-                                       args=args)
+        old, _, new = simult_de_motion(ks.cuda(), gt_ks.cuda(), args=args)
         old_metrics.append(old)
         new_metrics.append(new)
         
@@ -254,96 +218,25 @@ def check_simple_algorithm_version(val_dataset, args):
                   'vif_std': old_vif_vals.std(),
                   'ms_ssim_std': old_ms_ssim_vals.std(),
                   'l1_loss_std': old_l1_loss_vals.std()}
-    
-    print('SSIM:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-        old_stats['ssim_mean'], old_stats['ssim_std'], auto_stats['ssim_mean'], auto_stats['ssim_std']))
-    print('PSNR:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-        old_stats['psnr_mean'], old_stats['psnr_std'], auto_stats['psnr_mean'], auto_stats['psnr_std']))
-    print('VIF:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-        old_stats['vif_mean'], old_stats['vif_std'], auto_stats['vif_mean'], auto_stats['vif_std']))
-    print('MS-SSIM:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-        old_stats['ms_ssim_mean'], old_stats['ms_ssim_std'], auto_stats['ms_ssim_mean'], auto_stats['ms_ssim_std']))
-    print('L1-Loss:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-        old_stats['l1_loss_mean'], old_stats['l1_loss_std'], auto_stats['l1_loss_mean'], auto_stats['l1_loss_std']))
-
+    if verbose:
+        print('SSIM:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
+            old_stats['ssim_mean'], old_stats['ssim_std'], auto_stats['ssim_mean'], auto_stats['ssim_std']))
+        print('PSNR:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
+            old_stats['psnr_mean'], old_stats['psnr_std'], auto_stats['psnr_mean'], auto_stats['psnr_std']))
+        print('VIF:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
+            old_stats['vif_mean'], old_stats['vif_std'], auto_stats['vif_mean'], auto_stats['vif_std']))
+        print('MS-SSIM:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
+            old_stats['ms_ssim_mean'], old_stats['ms_ssim_std'], auto_stats['ms_ssim_mean'], auto_stats['ms_ssim_std']))
+        print('L1-Loss:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
+            old_stats['l1_loss_mean'], old_stats['l1_loss_std'], auto_stats['l1_loss_mean'], auto_stats['l1_loss_std']))
     return auto_stats, old_stats
 
-
-def true_demotion(ks, gt_ks, true_rot_vector, true_shift_vector):
-    """
-    ks: corrupted k-space
-    gt_ks: target k-space
-    true_rot_vector: rotation motion vector for de-motion, in rad
-    true_shift_vector: phase shift motion vector for de-motion
-    
-    Important! The motion vectors should already be inversed
-    versions of motion vectors
-    """
-    x_shifts, y_shifts = true_shift_vector[0], true_shift_vector[1]
-    phase_shift = -2 * math.pi * (
-        x_shifts * torch.linspace(0, 1, 320)[None, :, None].cuda() +
-        y_shifts * torch.linspace(0, 1, 320)[None, None, :].cuda())[0]
-    yp_ks = ks.abs() * (1j * (ks.angle() + phase_shift)).exp()
-    
-    new_k_space = R_differentiable(yp_ks, true_rot_vector)
-    return new_k_space
-    
-
-def check_max_possible_demotion(val_dataset):
-    old_metrics = []
-    new_metrics = []
-
-    for batch in tqdm(val_dataset):
-        gt_ks = batch['target_k_space']
-        gt_ks = gt_ks[0] + 1j * gt_ks[1]
-        ks = batch['k_space']
-        ks = ks[0] + 1j * ks[1]
-        # Look for sign for motion vectors
-        new_k_space = true_demotion(ks.cuda(), gt_ks.cuda(),
-                                    true_rot_vector=-batch['rot_vector'].cuda(),
-                                    true_shift_vector=-batch['phase_shift'].cuda()) 
-        new = calc_metrics(IFt(new_k_space).abs()[None, None].cpu().detach(),
-                                  IFt(gt_ks).abs()[None, None].cpu().detach())
-        new_metrics.append(new)
-        
-    auto_ssim_vals = np.array([d['ssim'] for d in new_metrics])
-    auto_psnr_vals = np.array([d['psnr'] for d in new_metrics])
-    auto_vif_vals = np.array([d['vif_p'] for d in new_metrics])
-    auto_ms_ssim_vals = np.array([d['ms_ssim'] for d in new_metrics])
-    auto_l1_loss_vals = np.array([d['l1_loss'] for d in new_metrics])
-    auto_stats = {'ssim_mean': auto_ssim_vals.mean(),
-                  'psnr_mean': auto_psnr_vals.mean(),
-                  'vif_mean': auto_vif_vals.mean(),
-                  'ms_ssim_mean': auto_ms_ssim_vals.mean(),
-                  'l1_loss_mean': auto_l1_loss_vals.mean(),
-                  
-                  'ssim_std': auto_ssim_vals.std(),
-                  'psnr_std': auto_psnr_vals.std(),
-                  'vif_std': auto_vif_vals.std(),
-                  'ms_ssim_std': auto_ms_ssim_vals.std(),
-                  'l1_loss_std': auto_l1_loss_vals.std()}
-    
-    print('Maximum possible de-motion metrics:')
-    print('SSIM:\n\t {:.7f} +- {:.5f}'.format(auto_stats['ssim_mean'], auto_stats['ssim_std']))
-    print('PSNR:\n\t {:.7f} +- {:.5f}'.format(auto_stats['psnr_mean'], auto_stats['psnr_std']))
-    print('VIF:\n\t {:.7f} +- {:.5f}'.format(auto_stats['vif_mean'], auto_stats['vif_std']))
-    print('MS-SSIM:\n\t {:.7f} +- {:.5f}'.format(auto_stats['ms_ssim_mean'], auto_stats['ms_ssim_std']))
-    print('L1-Loss:\n\t {:.7f} +- {:.5f}'.format(auto_stats['l1_loss_mean'], auto_stats['l1_loss_std']))
-    print('-'*30)
-    
     
 def load_val_dataset(motion_type, n_item):
+        
+#     val_data_path = PATH.VAL_PATH + '{}.h5'.format(motion_type)
+    val_data_path = PATH.VAL_PATH + PATH.VAL_NAME
     
-    if motion_type == 'randomize_harmonic':
-        val_data_path = '/home/ekuzmina/fastmri-demotion/datasets/randomized_harmonic_harder.h5'
-        
-    elif motion_type == 'randomize_periodic':
-        val_data_path = '/home/ekuzmina/fastmri-demotion/datasets/randomized_periodic_hard.h5'
-
-    else:
-        raise ValueError('Incorrect motion type')
-        
-    print(val_data_path)   
     shift_vector = torch.zeros((2, 320))
     rot_vector = torch.zeros((1, 320))
     
@@ -361,7 +254,7 @@ def load_val_dataset(motion_type, n_item):
              'rot_vector': rot_vector,
              'phase_shift': shift_vector}
         val_dataset.append(d)  
-    return val_dataset
+    return val_dataset  
 
 
 if __name__ == '__main__':
@@ -375,51 +268,31 @@ if __name__ == '__main__':
     print('Loss func:', args.loss)
     print('-'*30)
     
-    train_data_path = '/home/a_razumov/small_datasets/small_fastMRIh5_PD_3T/train_small_PD_3T.h5'
-    val_data_path = '/home/a_razumov/small_datasets/small_fastMRIh5_PD_3T/val_small_PD_3T.h5'
-        
     train_dataset = DemotionFastMRIh5Dataset(
-        train_data_path,
+        PATH.TRAIN_PATH + PATH.TRAIN_NAME,
         None,
         RandomMotionTransform(xy_max=5, theta_max=1.5, num_motions=5,
                               center_fractions=0.08, wave_num=6,
                               motion_type=args.motion_type, noise_lvl=0),
         z_slices=0.1)
-    train_dataset = torch.utils.data.Subset(train_dataset, torch.arange(len(train_dataset))[args.t:args.t+args.t])
-    
-    if args.motion_type == 'randomize_harmonic' or args.motion_type == 'randomize_periodic':
-        print('H'*100)
-        val_dataset = load_val_dataset(args.motion_type, args.v)
-    else: 
-        val_dataset = DemotionFastMRIh5Dataset(
-            val_data_path,
-            None,
-            RandomMotionTransform(xy_max=5, theta_max=1.5, num_motions=5,
-                                  center_fractions=0.08, wave_num=6,
-                                  motion_type=args.motion_type, noise_lvl=0),
-            z_slices=0.1)
-        val_dataset = torch.utils.data.Subset(val_dataset, torch.arange(len(val_dataset))[:args.v])
+    train_dataset = torch.utils.data.Subset(train_dataset, torch.arange(len(train_dataset))[:args.t])
+    val_dataset = load_val_dataset(args.motion_type, args.v)
     
     # Calculate Metrics of Corrupted Dataset
     auto_stats, old_stats = check_simple_algorithm_version(val_dataset, args)
-#     if args.motion_type != 'randomize':
-#         check_max_possible_demotion(val_dataset)
     
     # Run Algorithm with U-Net 
     unet = Unet(1, 1, 32, 6, batchnorm=torch.nn.InstanceNorm2d, init_type=args.init).cuda()
-#     unet.load_state_dict(torch.load('experiment_data/unet6_for_article_best.pt'))
-    unet = torch.load('experiment_data/unet6_for_article_best.pt')
-
     loss_func = get_loss_func(args.loss)
     optimizer_unet = torch.optim.Adam(unet.parameters(), lr=args.nn_lr, betas=(0.9, 0.999)) 
 
     beta1, beta2 = 0.89, 0.8999
-    writer = SummaryWriter(log_dir='runs/' + args.nexpr)
+    
+    writer = SummaryWriter(log_dir=PATH.LOG_PATH + args.nexpr)
     # Create blank file for metrics 
-    csv_name = 'experiment_data/' + args.nexpr + '.csv'
+    csv_name = PATH.SAVING_PATH + args.nexpr + '.csv'
     with open(csv_name, "w") as f:
         pass
-    
     metric_buf = {'psnr': 20.0,
                   'ssim': 0.4}
     
@@ -466,16 +339,19 @@ if __name__ == '__main__':
 
                 # Translation
                 phase_shift = -2 * math.pi * (
-                    x_shifts * torch.linspace(0, 320, 320)[None, :, None].cuda() + 
-                    y_shifts * torch.linspace(0, 320, 320)[None, None, :].cuda())[0]
-                new_k_space = ks.abs().cuda() * (1j * (ks.angle().cuda() + phase_shift)).exp()
+                    x_shifts * torch.linspace(0, ps, ps)[None, :, None].cuda() + 
+                    y_shifts * torch.linspace(0, ps, ps)[None, None, :].cuda())[0]
+                new_k_space = ks.abs().cuda() * (1j * (ks.angle().cuda() + \
+                                                       phase_shift)).exp()
                 # Rotation
                 yp_ks = R_differentiable(new_k_space, rot_vector)
                 yp_img = IFt(yp_ks).abs()
         
-                loss_net = (yp_img[None, None] * 1e4 * unet(yp_img[None, None] * 1e4).sigmoid()).mean()
+                loss_net = (yp_img[None, None] * 1e4 * \
+                            unet(yp_img[None, None] * 1e4).sigmoid()).mean()
 
-                x_grad, y_grad, rot_grad = torch.autograd.grad(loss_net, [x_shifts, y_shifts, rot_vector], create_graph=True)
+                x_grad, y_grad, rot_grad = torch.autograd.grad(loss_net, [x_shifts, y_shifts, rot_vector],
+                                                               create_graph=True)
                 x_grad, y_grad, rot_grad = x_grad * 1e-4, y_grad * 1e-4, rot_grad * 1e-4
                 x_moment1 = beta1 * x_moment1.detach() + (1. - beta1) * x_grad
                 x_moment2 = beta2 * x_moment2.detach() + (1. - beta2) * x_grad * x_grad + 1e-24
@@ -494,9 +370,10 @@ if __name__ == '__main__':
             y_shifts = y_shifts * zero_middle
             # Translation
             phase_shift = -2 * math.pi * (
-                x_shifts * torch.linspace(0, 320, 320)[None, :, None].cuda() + 
-                y_shifts * torch.linspace(0, 320, 320)[None, None, :].cuda())[0]
-            new_k_space = ks.abs().cuda() * (1j * (ks.angle().cuda() + phase_shift)).exp()
+                x_shifts * torch.linspace(0, ps, ps)[None, :, None].cuda() + 
+                y_shifts * torch.linspace(0, ps, ps)[None, None, :].cuda())[0]
+            new_k_space = ks.abs().cuda() * (1j * (ks.angle().cuda() + \
+                                                   phase_shift)).exp()
             # Rotation
             yp_ks = R_differentiable(new_k_space, rot_vector)
 
@@ -512,12 +389,11 @@ if __name__ == '__main__':
         losses_train = np.array(losses_train)
         writer.add_scalar('Train_loss', losses_train.mean(), epoch)
         
-        # Validation-------------------------------------------------------------------
+        # Validation
         if epoch % args.verb == 0: 
             unet.eval()
             new_metrics = []
             losses_val = []
-
             idx = 0
             for batch in tqdm(val_dataset):
                 gt_ks = batch['target_k_space']
@@ -529,8 +405,8 @@ if __name__ == '__main__':
                 ps_cf = int(ps//2 * 0.08)
                 zero_middle = torch.ones((ps)).cuda()
                 zero_middle[ps//2 - ps_cf:ps//2 + ps_cf] = 0.
-                img = IFt(ks).abs()
-                gt_img = IFt(gt_ks).abs()
+                img, gt_img = IFt(ks).abs(), IFt(gt_ks).abs()
+
                 x_shifts = torch.zeros(ps)
                 y_shifts = torch.zeros(ps)
                 x_shifts = torch.nn.Parameter(data=x_shifts.cuda(), requires_grad=True)
@@ -559,9 +435,9 @@ if __name__ == '__main__':
                     yp_img = IFt(yp_ks).abs()
 
                     loss_net = (yp_img[None, None] * 1e4 * unet(yp_img[None, None] * 1e4).sigmoid()).mean()
-
                     x_grad, y_grad, rot_grad = torch.autograd.grad(loss_net,
-                                                                   [x_shifts, y_shifts, rot_vector], create_graph=False)
+                                                                   [x_shifts, y_shifts, rot_vector],
+                                                                   create_graph=False)
                     x_grad, y_grad = x_grad * 1e-4, y_grad * 1e-4
                     rot_grad = rot_grad * 1e-4
                     x_moment1 = beta1 * x_moment1.detach() + (1. - beta1) * x_grad
@@ -627,8 +503,6 @@ if __name__ == '__main__':
                 old_stats['vif_mean'], old_stats['vif_std'], vif_vals.mean(), vif_vals.std()))
             print('MS-SSIM:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
                 old_stats['ms_ssim_mean'], old_stats['ms_ssim_std'], ms_ssim_vals.mean(), ms_ssim_vals.std()))
-    #         print('L1-Loss:\n\tmotion: {:.7f} +- {:.5f}\tL1M: {:.7f} +- {:.5f}'.format(
-    #             old_stats['l1_loss_mean'], old_stats['l1_loss_std'], l1_loss_vals.mean(), l1_loss_vals.std()))
 
             writer.add_scalars('Metric/SSIM', {'corrupted': old_stats['ssim_mean'],
                                                'autofocus': auto_stats['ssim_mean'],
@@ -645,10 +519,6 @@ if __name__ == '__main__':
             writer.add_scalars('Metric/MS-SSIM', {'corrupted': old_stats['ms_ssim_mean'],
                                                'autofocus': auto_stats['ms_ssim_mean'],
                                               'with_UNet': ms_ssim_vals.mean()}, epoch)
-
-    #         writer.add_scalars('Metric/L1-Loss', {'corrupted': old_stats['l1_loss_mean'],
-    #                                            'autofocus': auto_stats['l1_loss_mean'],
-    #                                           'with_UNet': l1_loss_vals.mean()}, epoch)
             writer.add_scalar('Val_loss', losses_val.mean(), epoch)
 
             # Save metrics to csv
@@ -661,15 +531,15 @@ if __name__ == '__main__':
                                 '{:.5f}'.format(vif_vals.mean()) + ' +- ' + '{:.3f}'.format(vif_vals.std()),
                                 '{:.5f}'.format(old_stats['ms_ssim_mean']) + ' +- ' + '{:.3f}'.format(old_stats['ms_ssim_std']),
                                 '{:.5f}'.format(ms_ssim_vals.mean()) + ' +- ' + '{:.3f}'.format(ms_ssim_vals.std()),]],
-    #                             '{:.5f}'.format(old_stats['l1_loss_mean']) + ' +- ' + '{:.3f}'.format(old_stats['l1_loss_std']),
-    #                             '{:.5f}'.format(l1_loss_vals.mean()) + ' +- ' + '{:.3f}'.format(l1_loss_vals.std())]],
-            columns=['loss_val', 'old_ssim_vals +- std', 'ssim_vals +- std', 'old_psnr_vals +- std', 'psnr_vals +- std', 'old_vif + std', 'vif + std', 'old_ms_ssim + std', 'ms_ssim + std',]) # 'old_l1_loss + std', 'l1_loss + std'])
+            columns=['loss_val', 'old_ssim_vals +- std', 'ssim_vals +- std', 'old_psnr_vals +- std', 'psnr_vals +- std', 'old_vif + std', 'vif + std', 'old_ms_ssim + std', 'ms_ssim + std',])
             df.to_csv(csv_name, mode='a', header = False, index=False)
             
+            # Save Model Weights
             if ssim_vals.mean() > metric_buf['ssim'] and psnr_vals.mean() > metric_buf['psnr']:
                 metric_buf['ssim'] = ssim_vals.mean()
                 metric_buf['psnr'] = psnr_vals.mean()
-                torch.save(unet, 'experiment_data/{}_best.pt'.format(args.nexpr))
-            torch.save(unet, 'experiment_data/{}_last.pt'.format(args.nexpr))
-            
+                torch.save(unet.state_dict(), PATH.SAVING_PATH + '{}_best.pt'.format(args.nexpr))
+
+            torch.save(unet.state_dict(), PATH.SAVING_PATH + '{}_last.pt'.format(args.nexpr))
     writer.close()
+    

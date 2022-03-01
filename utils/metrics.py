@@ -47,38 +47,6 @@ def create_window(window_size, channel=1):
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
     return window
 
-def kl_loss_freq_domain(pred, gt, L1 = False):
-
-    if L1:
-        l = F.l1_loss(pred, gt)
-    else:
-        l = F.mse_loss(pred, gt)
-        
-    fft2_pred = torch.fft.fft(torch.fft.fft(pred, dim=0), dim=1)
-    fft2_gt = torch.fft.fft(torch.fft.fft(gt, dim=0), dim=1)
-    
-    alpha = 0.7
-    fft2_pred = torch.stack((fft2_pred.real, fft2_pred.imag))
-    fft2_gt = torch.stack((fft2_gt.real, fft2_gt.imag))
-    
-
-    kl = F.kl_div(F.log_softmax(fft2_pred), F.softmax(fft2_gt))
-
-    return alpha * kl + (1 - alpha) * l
-
-
-def kl_loss_img_domain(pred, gt, L1 = False):
-
-    if L1:
-        l = F.l1_loss(pred, gt)
-    else:
-        l = F.mse_loss(pred, gt)
-            
-    alpha = 0.7    
-    kl = F.kl_div(F.log_softmax(pred), F.softmax(gt))
-
-    return alpha * kl + (1 - alpha) * l
-
 
 def pt_ssim(img1, img2, window_size=7, window=None, size_average=True, full=False, val_range=None):
     # Value range can be different from 255. Other common ranges are 1 (sigmoid) and 2 (tanh).
@@ -132,14 +100,18 @@ def pt_ssim(img1, img2, window_size=7, window=None, size_average=True, full=Fals
     return ret
 
 
-def pt_msssim(img1, img2, window_size=11, size_average=True, val_range=None, normalize=None):
+def pt_msssim(img1, img2, window_size=11, size_average=True, val_range=None,
+              normalize=None):
     device = img1.device
-    weights = torch.FloatTensor([0.0448, 0.2856, 0.3001, 0.2363, 0.1333]).to(device)
+    weights = torch.FloatTensor([0.0448, 0.2856, 0.3001,
+                                 0.2363, 0.1333]).to(device)
     levels = weights.size()[0]
     ssims = []
     mcs = []
     for _ in range(levels):
-        sim, cs = pt_ssim(img1, img2, window_size=window_size, size_average=size_average, full=True, val_range=val_range)
+        sim, cs = pt_ssim(img1, img2, window_size=window_size, 
+                          size_average=size_average, full=True,
+                          val_range=val_range)
 
         # Relu normalize (not compliant with original definition)
         if normalize == "relu":
@@ -187,11 +159,14 @@ class SSIM(torch.nn.Module):
         if channel == self.channel and self.window.dtype == img1.dtype:
             window = self.window
         else:
-            window = create_window(self.window_size, channel).to(img1.device).type(img1.dtype)
+            window = create_window(self.window_size,
+                                   channel).to(img1.device).type(img1.dtype)
             self.window = window
             self.channel = channel
 
-        return pt_ssim(img1, img2, window=window, window_size=self.window_size, size_average=self.size_average)
+        return pt_ssim(img1, img2, window=window,
+                       window_size=self.window_size,
+                       size_average=self.size_average)
 
 
 class MSSSIM(torch.nn.Module):
@@ -203,7 +178,8 @@ class MSSSIM(torch.nn.Module):
 
     def forward(self, img1, img2):
         # TODO: store window between calls if possible
-        return pt_msssim(img1, img2, window_size=self.window_size, size_average=self.size_average)
+        return pt_msssim(img1, img2, window_size=self.window_size,
+                         size_average=self.size_average)
 
 
 def mse_nn(gt: np.ndarray, pred: np.ndarray) -> np.ndarray:
@@ -229,61 +205,5 @@ def ssim_nn(
     ssim = 0
     for slice_num in range(gt.shape[0]):
         ssim = ssim + structural_similarity(
-            gt[slice_num], pred[slice_num], data_range=maxval
-        )
-
+            gt[slice_num], pred[slice_num], data_range=maxval)
     return ssim / gt.shape[0]
-
-
-def vif(ref, dist):
-    sigma_nsq = 2
-    eps = 1e-10
-
-    num = 0.0
-    den = 0.0
-    for scale in range(1, 5):
-
-        N = 2 ** (4 - scale + 1) + 1
-        sd = N / 5.0
-
-        if (scale > 1):
-            ref = scipy.ndimage.gaussian_filter(ref, sd)
-            dist = scipy.ndimage.gaussian_filter(dist, sd)
-            ref = ref[::2, ::2]
-            dist = dist[::2, ::2]
-
-        mu1 = scipy.ndimage.gaussian_filter(ref, sd)
-        mu2 = scipy.ndimage.gaussian_filter(dist, sd)
-        mu1_sq = mu1 * mu1
-        mu2_sq = mu2 * mu2
-        mu1_mu2 = mu1 * mu2
-        sigma1_sq = scipy.ndimage.gaussian_filter(ref * ref, sd) - mu1_sq
-        sigma2_sq = scipy.ndimage.gaussian_filter(dist * dist, sd) - mu2_sq
-        sigma12 = scipy.ndimage.gaussian_filter(ref * dist, sd) - mu1_mu2
-
-        sigma1_sq[sigma1_sq < 0] = 0
-        sigma2_sq[sigma2_sq < 0] = 0
-
-        g = sigma12 / (sigma1_sq + eps)
-        sv_sq = sigma2_sq - g * sigma12
-
-        g[sigma1_sq < eps] = 0
-        sv_sq[sigma1_sq < eps] = sigma2_sq[sigma1_sq < eps]
-        sigma1_sq[sigma1_sq < eps] = 0
-
-        g[sigma2_sq < eps] = 0
-        sv_sq[sigma2_sq < eps] = 0
-
-        sv_sq[g < 0] = sigma2_sq[g < 0]
-        g[g < 0] = 0
-        sv_sq[sv_sq <= eps] = eps
-
-        num += np.sum(np.log10(1 + g * g * sigma1_sq / (sv_sq + sigma_nsq)))
-        den += np.sum(np.log10(1 + sigma1_sq / sigma_nsq))
-
-    vifp = num / den
-
-    if np.isnan(vifp):
-        return 1.0
-    else:
-        return vifp

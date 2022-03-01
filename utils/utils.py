@@ -2,8 +2,25 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from k_space_reconstruction.utils.metrics import psnr, ssim
 import piq
+
+
+def t2i(t):
+    q = t - t.min()
+    w = q / t.max()
+    return w * 255
+
+def psnr(img1, img2):
+    mse = torch.mean((t2i(img1) - t2i(img2)) ** 2)
+    return 20 * torch.log10(255. / torch.sqrt(mse))
+
+def ssim(img1, img2):
+    from pytorch_msssim import ssim
+    return ssim(t2i(img1)[None,None], t2i(img2)[None,None])
+
+def normalize(x):
+    x1 = x - x.min()
+    return x1 / x1.max()
 
 
 def sample_noise(motion_vector, noise_lvl):
@@ -26,7 +43,6 @@ def normalize(x):
 def calc_metrics(y_pred: torch.Tensor, y_gt: torch.Tensor):
 
     metrics_dict = {}
-    
     metrics_dict['psnr'] = psnr(y_pred, y_gt).item()
     metrics_dict['ssim'] = ssim(y_pred, y_gt).item()
     metrics_dict['l1_loss'] = F.l1_loss(y_pred, y_gt).item()
@@ -36,6 +52,34 @@ def calc_metrics(y_pred: torch.Tensor, y_gt: torch.Tensor):
     metrics_dict['vif_p'] = piq.vif_p(normalize(y_pred), normalize(y_gt), 
                                       data_range=1.).item()
     return metrics_dict
+
+# Loss functions
+def l1_loss(pred_y, gt_y):
+    return ((t2i(gt_y) - t2i(pred_y)).abs()).sum() / torch.numel(pred_y)
+
+
+def ssim_loss(pred_y, gt_y):
+    return 1 - ssim(pred_y, gt_y)
+
+
+def compund_ssim_l1_loss(pred, gt):
+    from pytorch_msssim import ssim
+    f1 = l1_loss(pred, gt)
+    return (1 - 0.84) * f1 + 0.84 * (1 - ssim(gt[None,None], pred[None,None],
+                                              size_average=True,
+                                              nonnegative_ssim=True))
+    
+    
+def get_loss_func(loss_name):
+    if loss_name == 'l1':
+        loss = l1_loss
+    elif loss_name == 'ssim':
+        loss = ssim_loss
+    elif loss_name == 'ssim_l1':
+        loss = compund_ssim_l1_loss
+    else:
+        raise ValueError('Incorrect loss function name :(') 
+    return loss
 
 
 def plot_motion_vector(vec, motion_type):
